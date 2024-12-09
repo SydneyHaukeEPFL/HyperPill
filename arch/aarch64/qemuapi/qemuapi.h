@@ -27,6 +27,12 @@ const uint8_t excp_codes[2] = {
 
 void aarch64_set_esr_el2(aa64_syndrom syndrom);
 
+/* Concurrency related stuff */
+void qemu_wait_until_stop();
+void qemu_signal_stop();
+void qemu_set_running();
+bool qemu_is_running();
+
 #ifdef __cplusplus
 }
 #endif

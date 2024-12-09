@@ -1,5 +1,43 @@
 #include "qemu_c.h"
 #include "qemuapi.h"
+//#include "fuzz.h"
+
+static uint64_t pre_hyp_pc = 0; // previous PC before entering hypervisor
+
+static bool fuzztrace_input = false;
+QemuMutex barrier_mutex;
+QemuCond barrier_cond;
+
+/* Forward declaration */
+bool cpu0_get_fuzz_executing_input(void);
+
+void qemu_wait_until_stop() {
+    qemu_mutex_lock(&barrier_mutex);
+
+    while(cpu0_get_fuzz_executing_input()) {
+        qemu_cond_wait(&barrier_cond, &barrier_mutex);
+    }
+
+    qemu_mutex_unlock(&barrier_mutex);
+}
+
+void qemu_signal_stop() {
+    qemu_mutex_lock(&barrier_mutex);
+    fuzztrace_input = false;
+    qemu_cond_signal(&barrier_cond);
+    qemu_mutex_unlock(&barrier_mutex);
+}
+
+void qemu_set_running() {
+    qemu_mutex_lock(&barrier_mutex);
+    fuzztrace_input = true;
+	qemu_start_vm();
+    qemu_mutex_unlock(&barrier_mutex);
+}
+
+bool qemu_is_running() {
+    return fuzztrace_input;
+}
 
 static void dump_registers(CPUARMState *env) {
     FILE *regs_file = fopen("regs.bin", "wb");
@@ -73,6 +111,65 @@ static void dump_vm_state(CPUARMState *env) {
     }
 }
 
+/* Copied from QEMU 8.2.0, target/arm/tcg/helper-a64.c */
+static int el_from_spsr(uint32_t spsr)
+{
+    /* Return the exception level that this SPSR is requesting a return to,
+     * or -1 if it is invalid (an illegal return)
+     */
+    if (spsr & PSTATE_nRW) {
+        switch (spsr & CPSR_M) {
+        case ARM_CPU_MODE_USR:
+            return 0;
+        case ARM_CPU_MODE_HYP:
+            return 2;
+        case ARM_CPU_MODE_FIQ:
+        case ARM_CPU_MODE_IRQ:
+        case ARM_CPU_MODE_SVC:
+        case ARM_CPU_MODE_ABT:
+        case ARM_CPU_MODE_UND:
+        case ARM_CPU_MODE_SYS:
+            return 1;
+        case ARM_CPU_MODE_MON:
+            /* Returning to Mon from AArch64 is never possible,
+             * so this is an illegal return.
+             */
+        default:
+            return -1;
+        }
+    } else {
+        if (extract32(spsr, 1, 1)) {
+            /* Return with reserved M[1] bit set */
+            return -1;
+        }
+        if (extract32(spsr, 0, 4) == 1) {
+            /* return to EL0 with M[0] bit set */
+            return -1;
+        }
+        return extract32(spsr, 2, 2);
+    }
+}
+
+/* Forward declaration */
+void fuzz_emu_stop_normal();
+
+static void pre_el_change_fn(ARMCPU *cpu, void *opaque) {
+	CPUARMState *env = &cpu->env;
+    CPUState *cs = env_cpu(env);
+
+    unsigned int cur_el = arm_current_el(env);
+    unsigned int spsr_idx = aarch64_banked_spsr_index(cur_el);
+    uint32_t spsr = env->banked_spsr[spsr_idx];
+    unsigned int new_el = el_from_spsr(spsr);
+
+    /* If we exit the hypervisor */
+    if (cur_el == 2 && new_el == 1 && 
+        pre_hyp_pc == env->elr_el[2]) 
+    {
+        fuzz_emu_stop_normal();
+    }
+}
+
 static void el_change_fn(ARMCPU *cpu, void *opaque) {
 	CPUARMState *env = &cpu->env;
     CPUState *cs = env_cpu(env);
@@ -80,11 +177,15 @@ static void el_change_fn(ARMCPU *cpu, void *opaque) {
 	//unsigned int new_el = env->exception.target_el;
 	unsigned int cur_el = arm_current_el(env);
 
+    /* If we detect a hypervisor call */
     if (cur_el == 2 && cs->exception_index == EXCP_HVC) {
-        //printf("Call to Hypervisor!\n");
+        /* If we detect OUR hypervisor call */
         if (env->xregs[0] == 0xdeadbeef) {
             printf("======== Hyperpill ! ========\n");
-            //dump_vm_state(env);
+
+            /* Save PC address pre VMENTER */
+            pre_hyp_pc = env->elr_el[2];
+
             vm_stop(RUN_STATE_PAUSED);
             printf("VM stopped. You can now take a snapshot \
                     in QEMU monitor: savevm <snapshot_tag>\n");
@@ -93,10 +194,12 @@ static void el_change_fn(ARMCPU *cpu, void *opaque) {
 }
 
 void aarch64_set_xregs(uint64_t xregs[32]) {
+    printf("Setting regs\n");
     CPUState *cpu;
     CPU_FOREACH(cpu) {
         CPUARMState *env = &(ARM_CPU(cpu))->env;
         if (env->xregs[0] == 0xdeadbeef) { // FIXME : here we are assuming the CPU is stopped right after a VM_EXIT. CHANGE THAT !
+            printf("FOUND DEADBEEF\n");
             memcpy(env->xregs, xregs, sizeof(xregs[32]));
             break;
         }
@@ -109,6 +212,7 @@ void aarch64_set_esr_el2(aa64_syndrom syndrom) {
     CPU_FOREACH(cpu) {
         CPUARMState *env = &(ARM_CPU(cpu))->env;
         if (env->xregs[0] == 0xdeadbeef) { // FIXME : here we are assuming the CPU is stopped right after a VM_EXIT. CHANGE THAT !
+            printf("FOUND DEADBEEF");
             uint8_t excp_code = excp_codes[syndrom];
             env->cp15.esr_el[2] |= (uint64_t)excp_code << 26; // TODO : add IL and ISS fields
             break;
@@ -140,20 +244,24 @@ bool qemu_reload_vm(char *tag) {
 
 void init_qemu(int argc, char **argv) {
     qemu_init(argc, argv);
+
+    qemu_mutex_init(&barrier_mutex);
+    qemu_cond_init(&barrier_cond);
     
     CPUState *cpu;
     CPU_FOREACH(cpu) {
         arm_register_el_change_hook(ARM_CPU(cpu), el_change_fn, NULL);
+        arm_register_pre_el_change_hook(ARM_CPU(cpu), pre_el_change_fn, NULL);
     }
 
     char *snapshot_tag = getenv("SNAPSHOT_TAG");
     if (snapshot_tag != NULL) {
         qemu_reload_vm(snapshot_tag);
+    } else {
         vm_start();
+        qemu_main_loop();
+        qemu_cleanup(0);
     }
-
-    qemu_main_loop();
-    qemu_cleanup(0);
 }
 
 //void cpu_physical_memory_rw(hwaddr addr, void *buf,
