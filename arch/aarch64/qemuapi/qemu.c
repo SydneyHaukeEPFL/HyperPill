@@ -158,15 +158,21 @@ static void pre_el_change_fn(ARMCPU *cpu, void *opaque) {
     CPUState *cs = env_cpu(env);
 
     unsigned int cur_el = arm_current_el(env);
-    unsigned int spsr_idx = aarch64_banked_spsr_index(cur_el);
-    uint32_t spsr = env->banked_spsr[spsr_idx];
-    unsigned int new_el = el_from_spsr(spsr);
+    printf("pre_el_change\n");
 
     /* If we exit the hypervisor */
-    if (cur_el == 2 && new_el == 1 && 
-        pre_hyp_pc == env->elr_el[2]) 
-    {
-        fuzz_emu_stop_normal();
+    if (cur_el == 2) {
+        unsigned int spsr_idx = aarch64_banked_spsr_index(cur_el);
+        uint32_t spsr = env->banked_spsr[spsr_idx];
+        unsigned int new_el = el_from_spsr(spsr);
+    
+        printf("Detecting EL2 -> EL%u\n", new_el);
+        if (new_el == 1) {
+            if (pre_hyp_pc == env->elr_el[2]) {
+                printf("Detecting an ERET to guest VM\n");
+                fuzz_emu_stop_normal();
+            }
+        }
     }
 }
 
@@ -182,9 +188,6 @@ static void el_change_fn(ARMCPU *cpu, void *opaque) {
         /* If we detect OUR hypervisor call */
         if (env->xregs[0] == 0xdeadbeef) {
             printf("======== Hyperpill ! ========\n");
-
-            /* Save PC address pre VMENTER */
-            pre_hyp_pc = env->elr_el[2];
 
             vm_stop(RUN_STATE_PAUSED);
             printf("VM stopped. You can now take a snapshot \
@@ -221,11 +224,16 @@ void aarch64_set_esr_el2(aa64_syndrom syndrom) {
 }
 
 void qemu_start_vm() {
+    printf("VM start\n");
     vm_start();
+    qemu_mutex_unlock_iothread();
 }
 
 bool qemu_reload_vm(char *tag) {
     Error *err;
+
+    if(!qemu_mutex_iothread_locked())
+        qemu_mutex_lock_iothread();
 
     vm_stop(RUN_STATE_RESTORE_VM);
 
@@ -240,6 +248,18 @@ bool qemu_reload_vm(char *tag) {
     return success;
 }
 
+void save_pre_hyp_pc() {
+    // TODO
+    CPUState *cpu;
+    CPU_FOREACH(cpu) {
+        CPUARMState *env = &(ARM_CPU(cpu))->env;
+        if (env->xregs[0] == 0xdeadbeef) { // FIXME : here we are assuming the CPU is stopped right after a VM_EXIT. CHANGE THAT !
+            printf("found deadbeef and saved pre_hyp_pc\n");
+            pre_hyp_pc = env->elr_el[2];
+        }
+    }
+
+}
 
 
 void init_qemu(int argc, char **argv) {
@@ -257,11 +277,14 @@ void init_qemu(int argc, char **argv) {
     char *snapshot_tag = getenv("SNAPSHOT_TAG");
     if (snapshot_tag != NULL) {
         qemu_reload_vm(snapshot_tag);
+        /* Save PC address pre VMENTER */
+        save_pre_hyp_pc();
     } else {
         vm_start();
         qemu_main_loop();
         qemu_cleanup(0);
     }
+
 }
 
 //void cpu_physical_memory_rw(hwaddr addr, void *buf,
